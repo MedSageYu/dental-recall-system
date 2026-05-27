@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>口腔医学考研带背</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header>
+            <div class="header-left">
+                <h1>🦷 口腔考研带背</h1>
+                <span id="ollama-badge" class="badge badge-loading">检查中...</span>
+            </div>
+            <nav>
+                <button class="nav-btn active" data-page="library">📚 书库</button>
+                <button class="nav-btn" data-page="study">📖 背诵</button>
+                <button class="nav-btn" data-page="calendar">📅 日历</button>
+                <button class="nav-btn" data-page="stats">📊 统计</button>
+                <button class="nav-btn" data-page="manual">📘 手册</button>
+            </nav>
+            <button class="btn btn-sm" onclick="triggerShutdownSave()">💾 保存</button>
+        </header>
+
+        <main>
+            <!-- 书库页 -->
+            <div id="page-library" class="page active">
+                <div class="page-header">
+                    <h2>📚 我的书库</h2>
+                    <button class="btn btn-primary" onclick="showUploadModal()">+ 上传 PDF</button>
+                </div>
+                <div id="book-list" class="book-grid"></div>
+            </div>
+
+            <!-- 背诵页（一键到底） -->
+            <div id="page-study" class="page">
+                <div class="page-header">
+                    <h2>📖 开始背诵</h2>
+                    <select id="study-book-select" class="select" onchange="onBookSelect(this.value)">
+                        <option value="">选择一本书...</option>
+                    </select>
+                </div>
+                <div id="study-area">
+                    <!-- 初始状态 -->
+                    <div id="study-init" class="empty-state">请先从书库中选择一本书，或在上方下拉选择</div>
+                    <!-- 今日计划概览 -->
+                    <div id="study-plan-overview" style="display:none">
+                        <div class="card">
+                            <h3>📋 今日计划</h3>
+                            <div id="plan-summary" class="plan-summary"></div>
+                            <button class="btn btn-primary btn-lg" onclick="startStudyFlow()">🚀 开始学习</button>
+                        </div>
+                    </div>
+                    <!-- 背诵中 -->
+                    <div id="study-content" style="display:none">
+                        <div class="study-progress-bar">
+                            <div id="study-progress-fill" class="progress-fill"></div>
+                            <span id="study-progress-text">0/0</span>
+                        </div>
+                        <div id="study-topic-card" class="card">
+                            <div class="topic-header">
+                                <span id="study-topic-section" class="topic-section"></span>
+                                <span id="study-topic-difficulty" class="topic-difficulty"></span>
+                            </div>
+                            <h3 id="study-topic-title"></h3>
+                            <div id="study-topic-content" class="topic-content"></div>
+                            <div class="study-actions">
+                                <textarea id="recite-input" placeholder="在这里输入你的背诵内容..." rows="5"></textarea>
+                                <div class="btn-group">
+                                    <button class="btn btn-primary" onclick="submitRecite()">✅ 提交并继续</button>
+                                    <button class="btn" onclick="skipTopic()">⏭️ 跳过</button>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- AI 评分 loading -->
+                        <div id="ai-loading" class="card" style="display:none;text-align:center;padding:30px">
+                            <div class="spinner"></div>
+                            <p style="color:#888;margin:0">🤖 AI 正在评分中...</p>
+                        </div>
+                        <div id="ai-analysis" class="analysis-card" style="display:none">
+                            <div class="analysis-header">
+                                <h4>🤖 AI 评分</h4>
+                                <button class="btn btn-sm" onclick="toggleDims()">展开详细</button>
+                            </div>
+                            <div id="analysis-score" class="analysis-score"></div>
+                            <div id="analysis-dims" class="analysis-dims" style="display:none"></div>
+                            <div id="analysis-matched"></div>
+                            <div id="analysis-missing"></div>
+                            <div id="analysis-comment"></div>
+                            <button class="btn btn-primary" onclick="nextStudyTopic()" style="margin-top:12px;width:100%">下一个 →</button>
+                        </div>
+                    </div>
+                    <!-- 学习完成 - 汇总报告 -->
+                    <div id="study-complete" style="display:none">
+                        <div class="card complete-card">
+                            <div class="complete-loading" id="complete-loading">
+                                <div class="spinner"></div>
+                                <p>AI 正在生成今日总结...</p>
+                            </div>
+                            <div id="complete-report" style="display:none">
+                                <h3>🎉 今日学习完成！</h3>
+                                <div id="report-scores" class="report-scores"></div>
+                                <div id="report-summary" class="report-summary"></div>
+                                <div id="report-dims" class="report-dims"></div>
+                                <div id="report-tomorrow" class="report-tomorrow"></div>
+                                <div class="btn-group" style="margin-top:20px">
+                                    <button class="btn" onclick="switchPage('calendar')">📅 查看日历</button>
+                                    <button class="btn" onclick="switchPage('library')">📚 返回书库</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 日历页 -->
+            <div id="page-calendar" class="page">
+                <div class="page-header">
+                    <h2>📅 学习日历</h2>
+                    <div class="calendar-nav">
+                        <button class="btn btn-sm" onclick="changeMonth(-1)">◀</button>
+                        <span id="calendar-month-label"></span>
+                        <button class="btn btn-sm" onclick="changeMonth(1)">▶</button>
+                    </div>
+                </div>
+                <div class="calendar-grid" id="calendar-grid"></div>
+                <div id="calendar-day-detail" class="card" style="display:none">
+                    <h4 id="calendar-detail-date"></h4>
+                    <div id="calendar-detail-content"></div>
+                </div>
+            </div>
+
+            <!-- 统计页 -->
+            <div id="page-stats" class="page">
+                <div class="page-header">
+                    <h2>📊 学习统计</h2>
+                </div>
+                <div id="stats-content" class="stats-grid"></div>
+            </div>
+
+            <!-- 用户手册 -->
+            <div id="page-manual" class="page">
+                <div class="page-header"><h2>📘 使用手册</h2></div>
+                <div class="card manual-card">
+                    <h3>快速开始</h3>
+                    <ol>
+                        <li><strong>安装 Ollama</strong>：访问 <code>ollama.com</code> 下载安装，终端运行 <code>ollama pull qwen3.5:2b</code></li>
+                        <li><strong>上传教材</strong>：点击书库页「+ 上传 PDF」，选择口腔医学 PDF，设置背诵天数</li>
+                        <li><strong>开始背诵</strong>：点击书 → 点击「开始学习」→ 逐题背诵 → 看到 AI 评分 → 自动下一题</li>
+                        <li><strong>查看进度</strong>：日历页查看每日学习情况，统计页查看整体掌握度</li>
+                    </ol>
+                    <h3>学习流程</h3>
+                    <p>系统基于 <strong>艾宾浩斯遗忘曲线</strong> 安排复习。每天背诵内容包含：</p>
+                    <ul>
+                        <li>📌 <strong>新学</strong>：今天计划学习的新知识点</li>
+                        <li>🔄 <strong>复习</strong>：之前学过但即将遗忘的知识点</li>
+                        <li>↩️ <strong>顺延</strong>：昨天未完成的内容自动顺延到今天</li>
+                    </ul>
+                    <h3>评分说明</h3>
+                    <p>每个知识点评分为 5 个维度的加权总分：</p>
+                    <ul>
+                        <li>🎯 <strong>关键考点覆盖</strong>（30%）：核心考点是否提到</li>
+                        <li>📝 <strong>知识完整性</strong>（20%）：是否覆盖主要知识点</li>
+                        <li>✅ <strong>表述准确性</strong>（20%）：关键概念是否正确</li>
+                        <li>🔗 <strong>逻辑条理性</strong>（15%）：是否有条理</li>
+                        <li>💡 <strong>理解深度</strong>（15%）：是否展现深入理解</li>
+                    </ul>
+                    <h3>数据安全</h3>
+                    <ul>
+                        <li>所有数据存储在本地 SQLite 数据库</li>
+                        <li>每次启动自动备份，关机优雅保存</li>
+                        <li>背诵原文与 AI 分析分开存储，互不覆盖</li>
+                        <li>原文同步备份到 <code>data/recitations/</code> 目录</li>
+                    </ul>
+                    <h3>推荐配置</h3>
+                    <ul>
+                        <li><strong>AI 模型</strong>：Ollama + <code>qwen3.5:2b</code>（2.7GB，轻量高效）</li>
+                        <li><strong>备份模型</strong>：<code>qwen2.5:7b</code>（更精准但更慢）</li>
+                        <li><strong>端口</strong>：默认 8088，可通过命令行参数修改</li>
+                    </ul>
+                    <h3>命令行</h3>
+                    <pre><code># 启动（默认端口 8088）
+python3 app.py
+
+# 指定端口
+python3 app.py 9000
+
+# 安全退出
+# 按 Ctrl+C，自动保存所有数据</code></pre>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 上传弹窗 -->
+    <div id="upload-modal" class="modal" style="display:none">
+        <div class="modal-content">
+            <h3>📚 上传 PDF</h3>
+            <div class="form-group">
+                <label>书名</label>
+                <input type="text" id="upload-name" placeholder="自动识别或手动输入">
+            </div>
+            <div class="form-group">
+                <label>PDF 文件</label>
+                <input type="file" id="upload-file" accept=".pdf">
+            </div>
+            <div class="form-group">
+                <label>计划背完天数（可选）</label>
+                <input type="number" id="upload-days" placeholder="例如：30" min="1">
+            </div>
+            <div class="form-group">
+                <label>考研日期（可选）</label>
+                <input type="date" id="upload-exam-date">
+            </div>
+            <div id="upload-progress" style="display:none">
+                <div class="progress-bar"><div id="upload-progress-fill" class="progress-fill"></div></div>
+                <span id="upload-status">⏳ AI 正在解析中，请稍候...</span>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="doUpload()">上传并解析</button>
+                <button class="btn" onclick="hideUploadModal()">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 重命名弹窗 -->
+    <div id="rename-modal" class="modal" style="display:none">
+        <div class="modal-content">
+            <h3>✏️ 重命名</h3>
+            <input type="hidden" id="rename-book-id">
+            <input type="text" id="rename-input" placeholder="输入新书名...">
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="doRename()">保存</button>
+                <button class="btn" onclick="hideRenameModal()">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
