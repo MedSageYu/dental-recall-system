@@ -162,3 +162,61 @@ nav { display: flex; gap: 2px; flex-wrap: wrap; }
     nav { width: 100%; justify-content: flex-start; overflow-x: auto; }
     .report-scores { flex-wrap: wrap; }
 }
+
+/* ============================================================
+   评分状态栏（底部固定）
+   ============================================================ */
+
+.score-status-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    gap: 6px;
+    padding: 8px 12px;
+    background: rgba(18, 18, 18, 0.95);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    overflow-x: auto;
+    z-index: 1000;
+    -webkit-overflow-scrolling: touch;
+}
+
+.sb-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: all 0.3s ease;
+}
+
+.sb-done { background: rgba(255, 255, 255, 0.06); }
+.sb-pending { background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.2); }
+.sb-error { background: rgba(255, 255, 255, 0.03); opacity: 0.5; }
+
+.sb-title {
+    color: #888;
+    font-size: 11px;
+    max-width: 60px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sb-score {
+    font-weight: 700;
+    font-size: 13px;
+}
+
+.sb-wait {
+    animation: sb-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes sb-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}

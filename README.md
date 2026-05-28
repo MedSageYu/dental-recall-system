@@ -379,6 +379,7 @@ python3 batch_import.py
 ---
 
 ## 📄 License
+## 📄 License
 
 MIT License
 
