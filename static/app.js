@@ -7,6 +7,9 @@ let currentSessionId = null;
 let sessionStats = { correct: 0, wrong: 0, scores: [] };
 let calendarYear = new Date().getFullYear();
 let calendarMonth = new Date().getMonth() + 1;
+// AI 异步评分状态
+let aiScoreResults = {};  // topic_id -> {status, score}
+let aiPollTimers = {};    // topic_id -> intervalId
 
 // ============================================================
 // 初始化
@@ -311,6 +314,7 @@ function showStudyState(state) {
 function startStudyFlow() {
     studyIndex = 0;
     sessionStats = { correct: 0, wrong: 0, scores: [] };
+    clearScoreBar();
     showStudyState('study');
     // 启动会话
     fetch('/api/start-session', {
@@ -350,11 +354,24 @@ async function submitRecite() {
     const text = document.getElementById('recite-input').value.trim();
     if (!text) { alert('请输入背诵内容'); return; }
 
-    // 禁用按钮 + 显示 AI loading
     const btns = document.querySelectorAll('#study-content .btn-primary');
     btns.forEach(b => b.disabled = true);
-    document.getElementById('ai-loading').style.display = 'block';
-    document.getElementById('ai-analysis').style.display = 'none';
+
+    // 立即显示标准答案
+    const contentEl = document.getElementById('study-topic-content');
+    if (t.content) {
+        contentEl.innerHTML = '<div style="color:#888;font-size:12px;margin-bottom:6px">📖 标准答案：</div>' + esc(t.content);
+        contentEl.style.display = 'block';
+    }
+
+    // 显示 AI 评分中状态
+    const analysisEl = document.getElementById('ai-analysis');
+    analysisEl.style.display = 'block';
+    document.getElementById('analysis-score').innerHTML = '<div class="spinner" style="display:inline-block;vertical-align:middle;margin-right:8px"></div> <span style="color:#888">AI 正在评分...</span>';
+    document.getElementById('analysis-dims').style.display = 'none';
+    document.getElementById('analysis-matched').innerHTML = '';
+    document.getElementById('analysis-missing').innerHTML = '';
+    document.getElementById('analysis-comment').innerHTML = '';
 
     try {
         const r = await fetch('/api/study', {
@@ -363,30 +380,110 @@ async function submitRecite() {
         });
         const d = await r.json();
 
-        // 隐藏 loading
-        document.getElementById('ai-loading').style.display = 'none';
-
-        if (d.comparison && d.comparison.total !== undefined) {
-            showAnalysis(d.comparison, t.content);
-            const score = d.comparison.total || 0;
-            sessionStats.scores.push(score);
-            if (score >= 55) sessionStats.correct++;
-            else sessionStats.wrong++;
-        } else if (d.comparison && d.comparison.score !== undefined) {
-            showAnalysis(d.comparison, t.content);
-            sessionStats.scores.push(d.comparison.score);
-            if (d.comparison.score >= 55) sessionStats.correct++;
-            else sessionStats.wrong++;
+        if (d.success) {
+            // 秒出：显示同义表达评分
+            if (d.comparison && Object.keys(d.comparison).length > 0) {
+                showAnalysis(d.comparison, t.content);
+            }
+            // 后台 AI 深度评分（状态栏轮询）
+            startAiPolling(t.id, t.title);
         } else {
-            sessionStats.scores.push(0);
-            nextStudyTopic();
+            alert('提交失败: ' + (d.error || '未知错误'));
         }
     } catch (e) {
         console.error('submitRecite:', e);
-        document.getElementById('ai-loading').style.display = 'none';
         alert('提交失败: ' + e.message);
     }
     btns.forEach(b => b.disabled = false);
+}
+
+// ============================================================
+// 底部评分状态栏 + AI 异步轮询
+// ============================================================
+
+function updateScoreBar(topicId, title, score, source) {
+    aiScoreResults[topicId] = { status: source === 'ai' ? 'done' : 'regex', score: score, title: title };
+    renderScoreBar();
+}
+
+function startAiPolling(topicId, title) {
+    aiScoreResults[topicId] = { status: 'pending', score: null, title: title };
+    renderScoreBar();
+    let elapsed = 0;
+    const timer = setInterval(async () => {
+        elapsed += 2;
+        if (elapsed > 120) {
+            clearInterval(timer);
+            aiScoreResults[topicId].status = 'timeout';
+            renderScoreBar();
+            return;
+        }
+        try {
+            const r = await fetch('/api/ai-score?topic_id=' + topicId);
+            const d = await r.json();
+            if (d.status === 'done' && d.score) {
+                clearInterval(timer);
+                var aiTotal = d.score.total || d.score.score || 0;
+                aiScoreResults[topicId] = { status: 'done', score: aiTotal, title: title, full: d.score };
+                renderScoreBar();
+                updateSessionScore(topicId, aiTotal);
+                // 更新分析卡片（显示 AI 评分详情）
+                showAnalysis(d.score, null);
+            } else if (d.status === 'error') {
+                clearInterval(timer);
+                aiScoreResults[topicId].status = 'error';
+                renderScoreBar();
+                document.getElementById('analysis-score').innerHTML = '<span style="color:#f44">AI 评分失败，请重试</span>';
+            }
+        } catch (e) { /* ignore network errors */ }
+    }, 2000);
+    aiPollTimers[topicId] = timer;
+}
+
+function updateSessionScore(topicId, newScore) {
+    var idx = studyTopics.findIndex(function(t) { return t.id === topicId; });
+    if (idx >= 0 && idx < sessionStats.scores.length) {
+        var oldScore = sessionStats.scores[idx];
+        sessionStats.scores[idx] = newScore;
+        if (oldScore < 55 && newScore >= 55) { sessionStats.correct++; sessionStats.wrong--; }
+        else if (oldScore >= 55 && newScore < 55) { sessionStats.correct--; sessionStats.wrong++; }
+    }
+}
+
+function renderScoreBar() {
+    var bar = document.getElementById('score-status-bar');
+    if (!bar) return;
+    var entries = Object.entries(aiScoreResults);
+    if (entries.length === 0) { bar.style.display = 'none'; return; }
+    bar.style.display = 'flex';
+    var html = '';
+    for (var i = 0; i < entries.length; i++) {
+        var tid = entries[i][0];
+        var e = entries[i][1];
+        var shortTitle = (e.title || '').substring(0, 8);
+        if (e.status === 'done') {
+            var cls = e.score >= 85 ? 'score-excellent' : e.score >= 70 ? 'score-good' : e.score >= 55 ? 'score-ok' : 'score-bad';
+            html += '<div class="sb-item sb-done" title="' + esc(e.title) + ': ' + e.score + '分">' +
+                '<span class="sb-title">' + esc(shortTitle) + '</span>' +
+                '<span class="sb-score ' + cls + '">' + e.score + '</span></div>';
+        } else if (e.status === 'pending') {
+            html += '<div class="sb-item sb-pending" title="' + esc(e.title) + ': AI评分中...">' +
+                '<span class="sb-title">' + esc(shortTitle) + '</span>' +
+                '<span class="sb-wait">⏳</span></div>';
+        } else {
+            html += '<div class="sb-item sb-error" title="' + esc(e.title) + ': 失败">' +
+                '<span class="sb-title">' + esc(shortTitle) + '</span>' +
+                '<span class="sb-score">-</span></div>';
+        }
+    }
+    bar.innerHTML = html;
+}
+
+function clearScoreBar() {
+    aiScoreResults = {};
+    for (var k in aiPollTimers) clearInterval(aiPollTimers[k]);
+    aiPollTimers = {};
+    renderScoreBar();
 }
 
 function skipTopic() {

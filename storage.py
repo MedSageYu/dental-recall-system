@@ -58,6 +58,7 @@ def init_db():
         title TEXT NOT NULL,
         content TEXT,
         keywords TEXT,
+        key_expressions TEXT,
         section TEXT DEFAULT '',
         difficulty INTEGER DEFAULT 3,
         memory_level INTEGER DEFAULT 0,
@@ -168,6 +169,7 @@ def _migrate_schema(conn):
         ("study_records", "dim_depth", "REAL DEFAULT 0"),
         ("study_records", "total_score", "REAL DEFAULT 0"),
         ("daily_plans", "deferred", "INTEGER DEFAULT 0"),
+        ("topics", "key_expressions", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:

@@ -220,56 +220,193 @@ def summarize_topics(raw_text: str, progress_cb=None) -> dict:
 # 多维度背诵评分（核心新功能）
 # ============================================================
 
-SCORE_SYSTEM = """你是一位口腔医学考研辅导老师。对学生背诵进行多维度评分。
+SCORE_SYSTEM = """你是口腔医学考研阅卷老师。对学生背诵进行评分。
 
-评分维度（每个0-100分）：
-1. completeness（知识完整性）：是否覆盖了原文的主要知识点
-2. keypoints（关键考点覆盖）：核心考点是否提到
-3. accuracy（表述准确性）：关键概念是否表述正确
-4. logic（逻辑条理性）：背诵是否有条理、有逻辑
-5. depth（理解深度）：是否展现对知识的深入理解，而非简单复述
+## 评分规则（必须严格执行）
 
-注意：
-- 不要求一字一句一致，意思对即可
-- 用不同表述覆盖相同意思，算覆盖
-- 评分要有区分度：差的给30-50，一般的50-70，好的70-90，优秀的90+
-- 避免所有评分都集中在70-90"""
+### 第一步：提取要点
+从原文提取所有编号子要点（(1)(2)(3) ①②③ 等），列出清单。
 
-SCORE_PROMPT = """请对比【背诵内容】和【原文知识点】，进行多维度评分。
+### 第二步：逐个判断
+对每个要点，判断学生是否覆盖：
+- covered：核心意思已表达（允许口语化、同义替换）
+- partial：提到了但不完整或有轻微错误
+- missed：完全未提及
 
-知识点：{title}
-关键考点：{key_points}
+### 第三步：逐维度打分（每个 0-100，独立打分）
+1. completeness（完整性）：covered 数 / 总要点数 × 100
+2. keypoints（考点覆盖）：关键考点（标★的）覆盖比例 × 100
+3. accuracy（准确性）：学生表述是否有错误，有错误扣分
+4. logic（条理性）：背诵是否有条理、分点
+5. depth（理解深度）：是否展现了对知识的理解，而非死记硬背
 
-原文：
+### 第四步：计算总分（你不能直接给总分！必须从子分算）
+total = completeness × 0.25 + keypoints × 0.30 + accuracy × 0.20 + logic × 0.125 + depth × 0.125
+四舍五入取整。
+
+### 硬性约束
+- 严禁给 total 加分或减分，total 必须等于子分加权
+- 大多数背诵在 40-65 分之间，给 80+ 必须是真正优秀的背诵
+- 口语化表达算覆盖（“角化变少” = “角化程度降低”）
+- 不要因为文采好就加分，也不要因为口语化扣分"""
+
+SCORE_PROMPT = """按以下步骤评分，严格按 JSON 输出：
+
+## 原文要点：{key_points}
+## 知识点：{title}
+
+## 原文：
 {original}
 
-学生背诵：
+## 学生背诵：
 {recited}
 
-严格按 JSON 格式输出：
+## 输出格式（严格 JSON，不要输出其他内容）：
 ```json
 {{
-  "completeness": 75,
-  "keypoints": 80,
-  "accuracy": 70,
-  "logic": 65,
-  "depth": 60,
-  "total": 71,
-  "matched_points": ["已覆盖的考点"],
-  "missing_points": [
-    {{
-      "point": "遗漏考点",
-      "importance": "high/medium/low",
-      "suggestion": "记忆建议"
-    }}
+  "points": ["要点1", "要点2", "要点3"],
+  "evals": [
+    {{"p": "要点1", "s": "covered", "e": "学生说了xxx"}},
+    {{"p": "要点2", "s": "missed", "e": "未提及"}}
   ],
-  "comment": "总体评价"
+  "covered": 3,
+  "partial": 1,
+  "missed": 2,
+  "completeness": 50,
+  "keypoints": 45,
+  "accuracy": 60,
+  "logic": 55,
+  "depth": 50,
+  "total": 51,
+  "matched": ["已覆盖的要点1"],
+  "missing": [{{"point": "遗漏要点", "imp": "high", "tip": "记忆建议"}}],
+  "comment": "一句话评价"
 }}
 ```"""
 
 
+# ============================================================
+# 上传时预处理：AI 提取同义表达（只跑一次）
+# ============================================================
 
-import re
+EXPR_SYSTEM = """你是口腔医学教师。你的任务是从课本知识点中提取"关键考点"，并为每个考点列出可能的同义表达。
+
+规则：
+1. 找出原文中的编号子要点（(1)(2)(3)或①②③等），每个作为一组
+2. 每组列出3-6个同义表达，覆盖：口语化说法、缩写、不同表述方式
+3. 同义表达要短（5-20字），用于快速正则匹配
+4. 不改变原意，不编造内容
+"""
+
+EXPR_PROMPT = """从以下口腔医学知识点中提取关键考点和同义表达：
+
+{content}
+
+严格 JSON 格式输出：
+```json
+{{
+  "groups": [
+    {{
+      "point": "原始子要点文字",
+      "exprs": ["同义表达1", "同义表达2", "同义表达3"]
+    }}
+  ]
+}}
+```"""
+
+
+def generate_key_expressions(topic_content: str) -> list:
+    """调用 AI 为知识点生成同义表达组
+
+    Returns:
+        [
+            {"point": "牙龈上皮角化程度降低",
+             "exprs": ["角化降低", "角化减少", "角化变少", "角化程度下降"]},
+            ...
+        ]
+    """
+    if not topic_content or len(topic_content) < 30:
+        return []
+    try:
+        response = _call_ollama(
+            EXPR_PROMPT.format(content=topic_content[:3000]),
+            system=EXPR_SYSTEM, temperature=0.1)
+        result = _extract_json(response)
+        groups = result.get("groups", [])
+        # 过滤无效的
+        valid = []
+        for g in groups:
+            if g.get("point") and g.get("exprs"):
+                exprs = [e.strip() for e in g["exprs"] if len(e.strip()) >= 2]
+                if exprs:
+                    valid.append({"point": g["point"][:100], "exprs": exprs})
+        return valid
+    except Exception as e:
+        print(f"[generate_key_expressions] error: {e}", file=sys.stderr)
+        return []
+
+
+# ============================================================
+# 答题时评分：基于预处理的同义表达（秒出分）
+# ============================================================
+
+def score_by_expressions(recited_text: str, key_expressions: list) -> dict:
+    """基于预处理的同义表达做快速正则评分
+
+    key_expressions: [{point, exprs}, ...]
+    每个 group 中只要有任一同义表达被背诵覆盖，该点 = 满分
+    """
+    if not key_expressions:
+        # 无同义表达时，退回纯字级匹配
+        return None
+
+    recited = recited_text.strip().lower()
+    if not recited:
+        return {"total": 0, "matched_points": [], "missing_points": [],
+                "completeness": 0, "keypoints": 0, "accuracy": 0,
+                "logic": 0, "depth": 0, "coverage": "需加强",
+                "comment": "未输入背诵内容", "source": "expr"}
+
+    matched = []
+    missing = []
+    for group in key_expressions:
+        point = group.get("point", "")
+        exprs = group.get("exprs", [])
+        hit = False
+        for expr in exprs:
+            if len(expr) >= 2 and expr.lower() in recited:
+                hit = True
+                break
+        if hit:
+            matched.append(point[:60])
+        else:
+            missing.append({
+                "point": point[:80],
+                "importance": "high" if "★" in point else "medium",
+                "suggestion": "请背诵此要点"
+            })
+
+    total_points = len(matched) + len(missing)
+    if total_points == 0:
+        score = 0
+    else:
+        score = round(len(matched) / total_points * 100)
+
+    return {
+        "completeness": score,
+        "keypoints": score,
+        "accuracy": max(0, score - 10),
+        "logic": max(0, score - 5),
+        "depth": max(0, score - 5),
+        "total": score,
+        "score": score,
+        "matched_points": matched,
+        "missing_points": missing,
+        "comment": f"覆盖 {len(matched)}/{total_points} 个要点",
+        "coverage": ("优秀" if score >= 85 else "良好" if score >= 70 else
+                      "一般" if score >= 55 else "需加强"),
+        "source": "expr"
+    }
 
 
 def strict_compare_recitation(title: str, original: str, recited: str) -> dict:
@@ -380,32 +517,57 @@ def compare_recitation(title: str, key_points: list, original: str,
 
 def compare_recitation_ai(title: str, key_points: list, original: str,
                        recited: str) -> dict:
-    """多维度 AI 语义对比（保留原版，作为备用）"""
+    """AI 语义评分（后台调用）
+    
+    输出格式：5 个维度独立打分，total = 加权求和
+    权重：completeness×0.25 + keypoints×0.30 + accuracy×0.20 + logic×0.125 + depth×0.125
+    """
     prompt = SCORE_PROMPT.format(
         title=title,
         key_points="、".join(key_points) if key_points else "无",
-        original=original[:2000],
-        recited=recited)
-    response = _call_ollama(prompt, system=SCORE_SYSTEM, temperature=0.2)
+        original=original[:2500],
+        recited=recited[:1500])
+    response = _call_ollama(prompt, system=SCORE_SYSTEM, temperature=0.1)
     result = _extract_json(response)
-    # 确保有默认值
-    defaults = {"completeness": 0, "keypoints": 0, "accuracy": 0, "logic": 0,
-                "depth": 0, "total": 0, "matched_points": [], "missing_points": [],
-                "comment": "", "score": 0}
-    for k, v in defaults.items():
-        if k not in result:
-            result[k] = v
-    # 计算加权总分（如果没有）
-    if result["total"] == 0:
-        result["total"] = round(
-            result["completeness"] * 0.2 +
-            result["keypoints"] * 0.3 +
-            result["accuracy"] * 0.2 +
-            result["logic"] * 0.15 +
-            result["depth"] * 0.15, 1)
-    # 兼容旧接口
-    result["score"] = result["total"]
-    result["coverage"] = "优秀" if result["total"] >= 85 else "良好" if result["total"] >= 70 else "一般" if result["total"] >= 55 else "需加强"
+
+    # 兼容新旧字段名
+    covered = result.get("covered", result.get("covered_count", 0))
+    partial = result.get("partial", result.get("partial_count", 0))
+    missed = result.get("missed", result.get("missed_count", 0))
+    matched = result.get("matched", result.get("matched_points", []))
+    missing = result.get("missing", result.get("missing_points", []))
+    comment = result.get("comment", "")
+
+    # 读取 5 个维度分
+    c = result.get("completeness", 0)
+    k = result.get("keypoints", 0)
+    a = result.get("accuracy", 0)
+    l = result.get("logic", 0)
+    d = result.get("depth", 0)
+    total = result.get("total", 0)
+
+    # 如果 AI 没给 total 或 total=0，强制从子分算
+    if total == 0 and (c + k + a + l + d) > 0:
+        total = round(c * 0.25 + k * 0.30 + a * 0.20 + l * 0.125 + d * 0.125)
+
+    # 验证 total 是否等于子分加权（允许±3误差）
+    expected = round(c * 0.25 + k * 0.30 + a * 0.20 + l * 0.125 + d * 0.125)
+    if abs(total - expected) > 3 and expected > 0:
+        total = expected  # 强制用子分算的值
+
+    total = max(0, min(100, total))
+
+    return {
+        "completeness": c, "keypoints": k, "accuracy": a,
+        "logic": l, "depth": d, "total": total, "score": total,
+        "matched_points": matched if isinstance(matched, list) else [],
+        "missing_points": missing if isinstance(missing, list) else [],
+        "comment": comment,
+        "covered_count": covered, "partial_count": partial, "missed_count": missed,
+        "coverage": ("优秀" if total >= 85 else "良好" if total >= 70 else
+                      "一般" if total >= 55 else "需加强"),
+        "source": "ai",
+    }
     return result
 
 

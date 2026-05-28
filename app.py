@@ -18,7 +18,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 from pdf_parser import extract_text_from_pdf
-from ollama_ai import check_ollama, compare_recitation, generate_day_summary
+from ollama_ai import check_ollama, compare_recitation, compare_recitation_ai, generate_day_summary, generate_key_expressions, score_by_expressions
 from ebbinghaus import generate_daily_schedule, update_progress
 from storage import (
     init_db, backup_database, save_daily_summary, log_activity,
@@ -32,6 +32,10 @@ from storage import (
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# AI 评分缓存（topic_id -> {score, status, ...}）
+_ai_score_cache = {}
+_ai_cache_lock = threading.Lock()
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -58,6 +62,7 @@ class RecallHandler(BaseHTTPRequestHandler):
             "/api/tomorrow-preview": self._get_tomorrow_preview,
             "/api/settings": self._get_settings,
             "/api/day-summary": self._get_day_summary,
+            "/api/ai-score": self._get_ai_score,
         }
         if path in routes:
             routes[path](query)
@@ -216,6 +221,12 @@ class RecallHandler(BaseHTTPRequestHandler):
             log_activity("upload", {"book_id": book_id, "name": kb_name,
                                      "topic_count": len(all_topics), "target_days": target_days})
 
+            # 后台：为每个知识点生成同义表达（AI 预处理，耗时但只跑一次）
+            threading.Thread(
+                target=self._background_generate_expressions,
+                args=(book_id,),
+                daemon=True).start()
+
             # 发送完成
             self._sse_send({
                 "type": "done",
@@ -307,52 +318,123 @@ class RecallHandler(BaseHTTPRequestHandler):
                 self._json({"error": "知识点不存在"}, 404)
                 return
 
-            # AI 对比分析
+            # 同义表达评分（如果已预处理），秒出分数
             comparison = {}
             dims = {}
+            score_val = 0
             if recited_text:
-                comparison = compare_recitation(
-                    title=topic["title"],
-                    key_points=topic.get("keywords", []),
-                    original=topic.get("content", ""),
-                    recited=recited_text)
-                if "total" in comparison:
-                    is_correct = comparison["total"] >= 55
-                    dims = {
-                        "completeness": comparison.get("completeness", 0),
-                        "keypoints": comparison.get("keypoints", 0),
-                        "accuracy": comparison.get("accuracy", 0),
-                        "logic": comparison.get("logic", 0),
-                        "depth": comparison.get("depth", 0),
-                        "total": comparison.get("total", 0),
-                    }
+                key_exprs = topic.get("key_expressions", "")
+                if key_exprs:
+                    try:
+                        expr_groups = json.loads(key_exprs) if isinstance(key_exprs, str) else key_exprs
+                        comparison = score_by_expressions(recited_text, expr_groups)
+                    except Exception:
+                        pass
+                # 如果没有同义表达，退回正则匹配
+                if not comparison:
+                    comparison = compare_recitation(
+                        title=topic["title"],
+                        key_points=topic.get("keywords", []),
+                        original=topic.get("content", ""),
+                        recited=recited_text)
+                score_val = comparison.get("total", 0)
+                is_correct = score_val >= 55
+                dims = {
+                    "completeness": comparison.get("completeness", 0),
+                    "keypoints": comparison.get("keypoints", 0),
+                    "accuracy": comparison.get("accuracy", 0),
+                    "logic": comparison.get("logic", 0),
+                    "depth": comparison.get("depth", 0),
+                    "total": score_val,
+                }
 
             # 更新记忆等级
             current_level = topic.get("memory_level", 0)
             progress = update_progress(topic_id, is_correct, current_level)
             update_topic_progress(topic_id, is_correct, progress["new_level"], progress["next_review_date"])
 
-            # 保存记录（含原始文本保护 + txt 备份）
+            # 保存记录
             add_study_record(
                 topic_id, book_id, is_correct, recited_text,
                 matched=comparison.get("matched_points", []),
                 missing=[p.get("point", p) if isinstance(p, dict) else p
                          for p in comparison.get("missing_points", [])],
-                score=comparison.get("total", 0) / 100.0,
+                score=score_val / 100.0,
                 ai_analysis=json.dumps(comparison, ensure_ascii=False),
                 dims=dims)
 
-            log_activity("study", {"topic_id": topic_id, "score": comparison.get("total", 0), "correct": is_correct})
+            log_activity("study", {"topic_id": topic_id, "score": score_val, "correct": is_correct})
+
+            # 后台 AI 评分
+            with _ai_cache_lock:
+                _ai_score_cache[topic_id] = {"status": "pending", "score": None}
+            threading.Thread(
+                target=self._background_ai_score,
+                args=(topic_id, topic.get("title", ""),
+                      topic.get("keywords", []), topic.get("content", ""),
+                      recited_text),
+                daemon=True).start()
 
             self._json({
                 "success": True,
-                "comparison": comparison,
                 "is_correct": is_correct,
                 "new_level": progress["new_level"],
                 "next_review_date": progress["next_review_date"],
+                "ai_pending": True,
+                "comparison": comparison,
             })
         except Exception as e:
             self._json({"error": str(e)}, 500)
+
+    def _background_ai_score(self, topic_id, title, key_points, original, recited):
+        """后台线程：AI 评分，完成后写入缓存"""
+        try:
+            result = compare_recitation_ai(title, key_points, original, recited)
+            with _ai_cache_lock:
+                _ai_score_cache[topic_id] = {"status": "done", "score": result}
+        except Exception as e:
+            with _ai_cache_lock:
+                _ai_score_cache[topic_id] = {"status": "error", "score": None, "error": str(e)}
+
+    def _background_generate_expressions(self, book_id):
+        """后台线程：为整本书的所有知识点生成同义表达（上传后触发）"""
+        topics = get_topics(book_id)
+        total = len(topics)
+        print(f"[expr-gen] 开始为书 #{book_id} 生成同义表达，共 {total} 个知识点",
+              file=sys.stderr, flush=True)
+        for i, t in enumerate(topics):
+            try:
+                if t.get("key_expressions"):
+                    continue  # 已生成过，跳过
+                content = t.get("content", "")
+                if len(content) < 30:
+                    continue
+                exprs = generate_key_expressions(content)
+                if exprs:
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE topics SET key_expressions=? WHERE id=?",
+                        (json.dumps(exprs, ensure_ascii=False), t["id"]))
+                    conn.commit()
+                    conn.close()
+                    print(f"[expr-gen] #{i+1}/{total}: {t['title'][:30]}… → {len(exprs)} 组",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[expr-gen] #{i+1} 失败: {e}", file=sys.stderr, flush=True)
+        print(f"[expr-gen] 书 #{book_id} 同义表达生成完成", file=sys.stderr, flush=True)
+
+    def _get_ai_score(self, query):
+        """GET /api/ai-score?topic_id=123 — 轮询 AI 评分结果"""
+        topic_id = int(query.get("topic_id", [0])[0])
+        if not topic_id:
+            self._json({"error": "缺少 topic_id"}, 400)
+            return
+        with _ai_cache_lock:
+            entry = _ai_score_cache.get(topic_id)
+        if not entry:
+            self._json({"status": "none"})
+        else:
+            self._json(entry)
 
     # ============================================================
     # 学习会话
@@ -552,148 +634,103 @@ class RecallHandler(BaseHTTPRequestHandler):
         self._json({"success": True, "message": "数据已保存"})
 
     def _parse_topics_regex(self, raw_text, section_name):
-        """正则切题：多策略，按课本条目编号分割知识点
+        """正则切题：两层结构 — 先按一级标题分段，段内只切顶层编号
         
-        处理 OCR 常见问题：
-        1. 编号后句点丢失（如 "4生物学" 应为 "4.生物学"）
-        2. 混合编号格式（1. 1) （1）三．）
-        3. 页码水印干扰
+        核心逻辑：
+        1. 先按一级标题（一、二、三…）或顶层编号（1. 2. 3.）分大段
+        2. 每段内，(1)(2)(3) 是子要点，不单独切题
+        3. 只有在没有顶层编号时，才把 (1)(2) 当题目
         """
-        # 清洗水印和页码
+        # 清洗水印
         text = re.sub(r'微信搜索公众号.*?\n', '', raw_text)
         text = re.sub(r'记乎APP.*?\n', '', text)
-        text = re.sub(r'\d+\s*/\s*\d+\s*\n', '', text)  # 页码如 1 / 71
+        text = re.sub(r'\d+\s*/\s*\d+\s*\n', '', text)
         text = re.sub(r'银河研旅.*?\n', '', text)
         text = re.sub(r'{.*?}\n', '', text)
         text = re.sub(r'途中口腔医学考研.*?\n', '', text)
+        text = re.sub(r'\{笔记\}.*?\n', '', text)
 
-        def try_split(pattern_str, do_numbered=True):
-            """尝试一种分割模式，返回 topics 列表"""
-            if do_numbered:
-                parts = re.split(pattern_str, text)
-            else:
-                parts = re.split(pattern_str, text)
-            
-            topics = []
-            ti = 1
-            if len(parts) < 3:
-                return topics
-            
+        def make_topic(content, idx, sec):
+            """从一段文本生成一个 topic dict"""
+            content = content.strip()
+            if len(content) < 10:
+                return None
+            first_line = content.split('\n')[0].strip()[:80]
+            title = re.sub(r'[★sS]{1,5}', '', first_line).strip()
+            title = re.sub(r'[a-zA-Z]+(?:/[a-zA-Z]+)*[:：]?\s*', '', title).strip()
+            title = re.sub(r'\(\d+\)', '', title).strip()
+            if not title or len(title) < 2:
+                title = first_line[:40]
+            if len(title) > 60:
+                title = title[:60]
+            stars = content[:200].count('★')
+            difficulty = min(5, max(2, stars + 2)) if stars > 0 else 3
+            # 提取子要点 (1)(2)(3) ①②③
+            key_points = []
+            for line in content.split('\n'):
+                line = line.strip()
+                m = re.match(r'^[（(\u2460-\u2468]\d*[）)]?\s*(.+)', line)
+                if not m:
+                    m = re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩]\s*(.+)', line)
+                if m and len(m.group(1)) > 5:
+                    key_points.append(m.group(1)[:80])
+            return {
+                "id": idx, "title": title, "content": content,
+                "keywords": key_points[:5], "section": sec, "difficulty": difficulty,
+            }
+
+        # ===== 策略1：按顶层编号切（1. 2. 3. 或 1） 2） 3））=====
+        # 要求有明确分隔符（. ． 、 ） )），不匹配 (1) 因为 ( 不是 \s
+        topics = []
+        parts = re.split(r'(?:^|\n)\s*(\d{1,3})\s*[.．、）)]\s*', text)
+        if len(parts) >= 3:
             for i in range(1, len(parts) - 1, 2):
-                content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                if len(content) < 10:
-                    continue
+                t = make_topic(parts[i + 1] if i + 1 < len(parts) else "", len(topics) + 1, section_name)
+                if t:
+                    topics.append(t)
 
-                first_line = content.split('\n')[0].strip()[:80]
-                title = re.sub(r'[★sS]{1,5}', '', first_line).strip()
-                title = re.sub(r'[a-zA-Z]+(?:/[a-zA-Z]+)*[:：]?\s*', '', title).strip()
-                title = re.sub(r'\(\d+\)', '', title).strip()
-                if not title or len(title) < 2:
-                    title = first_line[:40]
-                if len(title) > 60:
-                    title = title[:60]
-
-                stars = content[:200].count('★')
-                difficulty = min(5, max(2, stars + 2)) if stars > 0 else 3
-
-                key_points = []
-                for line in content.split('\n'):
-                    line = line.strip()
-                    # 匹配子条目: (1) （1） 1） ① 等
-                    m = re.match(r'^\s*[（(]?\d+[）)]\s*(.+)', line)
-                    if not m:
-                        m = re.match(r'^\s*[①②③④⑤⑥⑦⑧⑨]\s*(.+)', line)
-                    if m and len(m.group(1)) > 5:
-                        key_points.append(m.group(1)[:80])
-
-                topics.append({
-                    "id": ti, "title": title, "content": content,
-                    "keywords": key_points[:5],
-                    "section": section_name, "difficulty": difficulty,
-                })
-                ti += 1
-            return topics
-
-        # ===== 策略1：统一编号（数字+可选分隔符+后缀中文）=====
-        # 处理: 1. 2． 3) 4(直接接中文,OCR丢句点的情况）
-        # 关键：后缀必须是中文或★，排除数字（避免匹配 0.97mm 这种小数）
-        topics = try_split(r'(?:^|\n)\s*(\d{1,3})\s*[.．、）)]?\s*(?=[\u4e00-\u9fff★])')
-
-        # ===== 策略2：大章节分隔（三． 四）—— 独立处理 =====
-        # 用捕获组版本的 split
-        parts2 = re.split(r'(?:^|\n)\s*([（(]?[一二三四五六七八九十]+[）).．、])\s*(?=[\u4e00-\u9fff]{4,})', text)
-        if len(parts2) >= 5:
-            topics2 = []
-            ti = 1
-            for i in range(1, len(parts2) - 1, 2):
-                content = parts2[i + 1].strip() if i + 1 < len(parts2) else ""
-                if len(content) < 30:
-                    continue
-                fl = content.split('\n')[0].strip()[:80]
-                ititle = re.sub(r'[★sS]+', '', fl).strip()
-                ititle = re.sub(r'[a-zA-Z]+(?:/[a-zA-Z]+)*[:：]?\s*', '', ititle).strip()
-                if len(ititle) > 60: ititle = ititle[:60]
-                istars = content[:200].count('★')
-                idiff = min(5, max(2, istars + 2)) if istars > 0 else 3
-                topics2.append({
-                    "id": ti, "title": ititle, "content": content,
-                    "keywords": [], "section": section_name, "difficulty": idiff,
-                })
-                ti += 1
-            if len(topics2) > len(topics):
-                topics = topics2
-
-        # ===== 策略3：括号编号兜底 =====
+        # ===== 策略2：按一级标题切（一、 二、 三．...）=====
         if len(topics) < 3:
-            topics3 = try_split(r'(?:^|\n)\s*[（(]\d{1,3}[）)]\s+')
-            if len(topics3) > 0:
-                topics = topics3
+            parts2 = re.split(r'(?:^|\n)\s*([（(]?[一二三四五六七八九十]+[）).．、])\s*(?=[\u4e00-\u9fff]{2,})', text)
+            if len(parts2) >= 5:
+                topics2 = []
+                for i in range(1, len(parts2) - 1, 2):
+                    t = make_topic(parts2[i + 1] if i + 1 < len(parts2) else "", len(topics2) + 1, section_name)
+                    if t:
+                        topics2.append(t)
+                if len(topics2) > len(topics):
+                    topics = topics2
 
-        # ===== 后处理：拆分超长topic（内容>1500字且包含内部编号）=====
+        # ===== 策略3：括号编号 — 仅当上面都失败时兜底 =====
+        if len(topics) < 2:
+            parts3 = re.split(r'(?:^|\n)\s*[（(](\d{1,3})[）)]\s+', text)
+            if len(parts3) >= 3:
+                topics3 = []
+                for i in range(1, len(parts3) - 1, 2):
+                    t = make_topic(parts3[i + 1] if i + 1 < len(parts3) else "", len(topics3) + 1, section_name)
+                    if t:
+                        topics3.append(t)
+                if len(topics3) > len(topics):
+                    topics = topics3
+
+        # ===== 后处理：拆分超长topic（>2000字）=====
         final_topics = []
         for t in topics:
-            if len(t["content"]) > 1500:
-                # 尝试在内容内部按编号重新分割
-                inner = re.split(r'(?:^|\n)\s*(\d{1,3})\s*[.．、）)]?\s*(?=[\u4e00-\u9fff]{4,})', t["content"])
+            if len(t["content"]) > 2000:
+                # 只按带句点的编号拆（不拆括号编号）
+                inner = re.split(r'(?:^|\n)\s*(\d{1,3})\s*[.．、]\s*', t["content"])
                 if len(inner) >= 5:
-                    inner_topics = []
-                    ti = 1
                     for j in range(1, len(inner) - 1, 2):
-                        ic = inner[j + 1].strip() if j + 1 < len(inner) else ""
-                        if len(ic) < 10:
-                            continue
-                        fl = ic.split('\n')[0].strip()[:80]
-                        ititle = re.sub(r'[★sS]+', '', fl).strip()
-                        ititle = re.sub(r'[a-zA-Z]+(?:/[a-zA-Z]+)*[:：]?\s*', '', ititle).strip()
-                        if not ititle or len(ititle) < 2:
-                            ititle = fl[:40]
-                        ititle = ititle[:60]
-                        istars = ic[:200].count('★')
-                        idiff = min(5, max(2, istars + 2)) if istars > 0 else 3
-                        ikeys = []
-                        for line in ic.split('\n'):
-                            m = re.match(r'^\s*[（(]?\d+[）)]\s*(.+)', line)
-                            if not m:
-                                m = re.match(r'^\s*[①②③④⑤⑥⑦⑧⑨]\s*(.+)', line)
-                            if m and len(m.group(1)) > 5:
-                                ikeys.append(m.group(1)[:80])
-                        inner_topics.append({
-                            "id": ti, "title": ititle, "content": ic,
-                            "keywords": ikeys[:5],
-                            "section": section_name, "difficulty": idiff,
-                        })
-                        ti += 1
-                    if len(inner_topics) > 1:
-                        final_topics.extend(inner_topics)
-                        continue
-            final_topics.append(t)
-        
-        # 重新编号
-        for i, t in enumerate(final_topics):
-            t["id"] = i + 1
+                        st = make_topic(inner[j + 1] if j + 1 < len(inner) else "", len(final_topics) + 1, section_name)
+                        if st:
+                            final_topics.append(st)
+                else:
+                    final_topics.append(t)
+            else:
+                final_topics.append(t)
 
-        # 如果没切出任何topic
-        if not final_topics and len(raw_text.strip()) > 100:
+        # 兜底：整段做一个 topic
+        if not final_topics and len(raw_text.strip()) > 10:
             final_topics.append({
                 "id": 1, "title": section_name,
                 "content": raw_text.strip()[:5000],
