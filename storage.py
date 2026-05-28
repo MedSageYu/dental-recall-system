@@ -149,6 +149,17 @@ def init_db():
         FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE,
         UNIQUE(book_id, summary_date)
     );
+
+    CREATE TABLE IF NOT EXISTS session_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER,
+        topic_id INTEGER NOT NULL,
+        recited_text TEXT,
+        score REAL DEFAULT 0,
+        snapshot_time TEXT DEFAULT (datetime('now', 'localtime')),
+        FOREIGN KEY (session_id) REFERENCES study_sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+    );
     """)
     # 迁移：给旧表加新列
     _migrate_schema(conn)

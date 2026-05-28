@@ -13,7 +13,7 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -28,6 +28,7 @@ from storage import (
     get_calendar_data, estimate_score, get_setting, set_setting,
     get_activity_log, get_today_activity,
     generate_daily_plan, get_today_plan, mark_plan_completed, save_day_summary, get_day_summary,
+    get_db,
 )
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -252,6 +253,7 @@ class RecallHandler(BaseHTTPRequestHandler):
         books = get_books()
         result = []
         for b in books:
+            b.pop("raw_text", None)  # 不返回 OCR 原文（太大，前端不需要）
             progress = get_book_progress(b["id"])
             result.append({**b, "progress": progress})
         self._json({"data": result})
@@ -476,9 +478,7 @@ class RecallHandler(BaseHTTPRequestHandler):
             self._json({"error": "缺少 book_id"}, 400)
             return
         # 查明天计划
-        from datetime import timedelta
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        from storage import get_db
         conn = get_db()
         topics = conn.execute(
             "SELECT id, title, section, difficulty FROM topics WHERE book_id=? AND plan_date=? ORDER BY topic_index LIMIT 20",
@@ -515,7 +515,6 @@ class RecallHandler(BaseHTTPRequestHandler):
                 self._json({"error": "缺少 book_id"}, 400)
                 return
             # 获取今日背诵记录
-            from storage import get_db
             today = datetime.now().strftime("%Y-%m-%d")
             conn = get_db()
             rows = conn.execute(
