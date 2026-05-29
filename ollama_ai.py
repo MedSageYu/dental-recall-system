@@ -3,6 +3,8 @@ Ollama 本地模型接口 v3
 新增：多维度评分、每日总结、大文件分块合并
 """
 import json
+import re
+import sys
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -568,7 +570,6 @@ def compare_recitation_ai(title: str, key_points: list, original: str,
                       "一般" if total >= 55 else "需加强"),
         "source": "ai",
     }
-    return result
 
 
 # ============================================================

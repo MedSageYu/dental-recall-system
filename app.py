@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from pdf_parser import extract_text_from_pdf
 from ollama_ai import check_ollama, compare_recitation, compare_recitation_ai, generate_day_summary, generate_key_expressions, score_by_expressions
-from ebbinghaus import generate_daily_schedule, update_progress
+from ebbinghaus import update_progress
 from storage import (
     init_db, backup_database, save_daily_summary, log_activity,
     add_book, get_books, get_book_by_id, update_book, delete_book, get_book_progress,
@@ -533,7 +533,6 @@ class RecallHandler(BaseHTTPRequestHandler):
                 records.append(d)
 
             # 明日预览
-            from datetime import timedelta
             tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             conn = get_db()
             tmr = conn.execute(
